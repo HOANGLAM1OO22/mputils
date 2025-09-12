@@ -1,0 +1,175 @@
+import java.nio.ByteBuffer
+import java.nio.file.StandardOpenOption
+
+internal class JPEGMetaWriter(private val uniFile: UniFile) : JPEGMetaBase(uniFile), ImageMetaWriter {
+
+    override fun reserveXMP(size: Int): ImageMetaReader.Box {
+        SLog.d(TAG, "reserveXMP: size=$size")
+        return try {
+            reserveXMPByMove(size)
+        } catch (e: Exception) {
+            SLog.w(TAG, "reserveXMPByMove failed, fallback to copy", e)
+            reserveXMPByCopy(size)
+        }
+    }
+
+    private fun reserveXMPByMove(size: Int): ImageMetaReader.Box {
+        SLog.i(TAG, "reserveXMPByMove: $size")
+        return uniFile.useFileChannel(StandardOpenOption.READ, StandardOpenOption.WRITE) {
+            var xmpBox: ImageMetaReader.Box? = null
+            it.position(JPEG_MARKER_SIZE.toLong()) // skip SOI marker
+
+            while (findNextApp1Marker(it) > 0) {
+                val (metaType, position, payload) = getMeta(it)
+                when (metaType) {
+                    MetaType.META_EXIF -> {
+                        val xmpAPP1Pos = position + payload
+                        val xmpPayloadOffset = xmpAPP1Pos + JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE
+
+                        it.position(xmpAPP1Pos)
+                        it.shiftRightSafely(size + JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE)
+
+                        // write XMP APP1 header
+                        it.position(xmpAPP1Pos)
+                        it.write(JPEG_APP1_MARKER)
+                        it.write((size + JPEG_LENGTH_SIZE).toShort())
+
+                        it.position(xmpPayloadOffset + size)
+                        xmpBox = ImageMetaReader.Box(xmpPayloadOffset, size.toLong(), byteReader)
+                    }
+
+                    MetaType.META_XMP -> {
+                        val xmpAPP1Pos = position - (JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE)
+                        val xmpAPP1Payload = payload + JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE
+                        it.position(xmpAPP1Pos)
+                        it.shiftLeftSafely(xmpAPP1Payload.toInt())
+                        it.position(xmpAPP1Pos)
+                    }
+
+                    else -> it.skipNBytes(payload.toInt())
+                }
+            }
+
+            if (xmpBox == null) {
+                // No EXIF, insert after SOI
+                val xmpAPP1Pos = JPEG_MARKER_SIZE.toLong()
+                val xmpPayloadOffset = xmpAPP1Pos + JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE
+
+                it.position(xmpAPP1Pos)
+                it.shiftRightSafely(size + JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE)
+
+                it.position(xmpAPP1Pos)
+                it.write(JPEG_APP1_MARKER)
+                it.write((size + JPEG_LENGTH_SIZE).toShort())
+                it.position(xmpPayloadOffset + size)
+
+                xmpBox = ImageMetaReader.Box(xmpPayloadOffset, size.toLong(), byteReader)
+            }
+
+            xmpBox!!
+        }
+    }
+
+    private fun reserveXMPByCopy(size: Int): ImageMetaReader.Box {
+        SLog.d(TAG, "reserveXMPByCopy: $size")
+        val (jpegBuffer, xmpPosition) = uniFile.newInputFileStream().use { stream ->
+            var buffer: ByteBuffer? = null
+            var offset = JPEG_MARKER_SIZE.toLong()
+            stream.channel.position(offset)
+
+            while (findNextApp1Marker(stream) > 0) {
+                val (metaType, position, payload) = getMeta(stream)
+                when (metaType) {
+                    MetaType.META_EXIF -> {
+                        val xmpAPP1Pos = position + payload
+                        val remains = stream.channel.size() - xmpAPP1Pos
+                        buffer = ByteBuffer.allocate((remains + JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE + size).toInt()).apply {
+                            putShort(JPEG_APP1_MARKER)
+                            putShort((size + JPEG_LENGTH_SIZE).toShort())
+                            val tailBytes = ByteArray(remains.toInt())
+                            stream.read(tailBytes)
+                            put(tailBytes)
+                            rewind()
+                        }
+                        offset = xmpAPP1Pos + JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE
+                    }
+                    MetaType.META_XMP -> {
+                        // skip old XMP
+                        val xmpAPP1Pos = position - (JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE)
+                        val xmpAPP1Payload = payload + JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE
+                        stream.skipNBytes(xmpAPP1Payload)
+                    }
+                    else -> stream.skipNBytes(payload)
+                }
+            }
+
+            buffer!! to offset
+        }
+
+        uniFile.useOutputFileChannel {
+            val xmpAPP1Pos = xmpPosition - (JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE)
+            it.position(xmpAPP1Pos)
+            it.write(jpegBuffer)
+            it.truncate(xmpAPP1Pos + jpegBuffer.limit().toLong())
+        }
+
+        return ImageMetaReader.Box(xmpPosition, size.toLong(), byteReader)
+    }
+
+    override fun removeXMP() {
+        TODO("Not yet implemented")
+    }
+
+    override fun writeExif(exifInfo: ExifInfo) {
+        TODO("Not yet implemented")
+    }
+
+    override fun writeXMP(xmpInfo: XMPInfo) {
+        if (!xmpInfo.edit().isDirty) return
+
+        val xmp = (xmpInfo as XMPInfoImpl).xmp
+        val xmpBuffer = XMPMetaFactory.serializeToBuffer(xmp, SerializeOptions().apply {
+            omitPacketWrapper = true
+            useCompactFormat = true
+        })
+
+        val signatureArray = XMP_SIGNATURE.toByteArray()
+        val requiredSize = signatureArray.size + xmpBuffer.size
+
+        var (xmpPosition, xmpPayload) = findXMPApp1Marker()
+
+        if (xmpPayload < requiredSize) {
+            val box = reserveXMP(requiredSize)
+            xmpPosition = box.offset
+            xmpPayload = box.length
+        }
+
+        uniFile.useOutputFileChannel { ch ->
+            ch.position(xmpPosition)
+            val buffer = ByteBuffer.allocate(requiredSize)
+            buffer.put(signatureArray)
+            buffer.put(xmpBuffer)
+            buffer.flip()
+            ch.write(buffer)
+
+            val pad = (xmpPayload.toInt() - requiredSize).coerceAtLeast(0)
+            if (pad > 0) ch.write(ByteBuffer.wrap(ByteArray(pad) { 0x20.toByte() }))
+        }
+    }
+
+    private fun findXMPApp1Marker(): Pair<Long, Long> {
+        uniFile.newInputFileStream().use {
+            it.channel.position(JPEG_MARKER_SIZE.toLong()) // skip SOI
+            while (findNextApp1Marker(it) > 0) {
+                val (metaType, position, payload) = getMeta(it)
+                if (metaType == MetaType.META_XMP) return position to payload
+                it.skipNBytes(payload)
+            }
+            return 0L to 0L
+        }
+    }
+
+    companion object {
+        private val TAG = SLog.tagOf(JPEGMetaWriter::class.java)
+    }
+}

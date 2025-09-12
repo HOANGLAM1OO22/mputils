@@ -1,0 +1,542 @@
+override fun writeXMP(xmpInfo: XMPInfo) {
+    if (!xmpInfo.edit().isDirty) {
+        SLog.i(TAG, "xmpInfo is clean, skip write")
+        return
+    }
+
+    val xmp = (xmpInfo as XMPInfoImpl).xmp
+    val xmpBuffer = XMPMetaFactory.serializeToBuffer(xmp, SerializeOptions().apply {
+        omitPacketWrapper = true
+        useCompactFormat = true
+    })
+
+    val signatureArray = XMP_SIGNATURE.toByteArray()
+    val requiredSize = signatureArray.size + xmpBuffer.size
+    val xmpBoxBuffer = ByteBuffer.allocate(requiredSize).apply {
+        put(signatureArray)
+        put(xmpBuffer)
+        flip()
+    }
+
+    // tìm vị trí xmp (payload start) và kích thước payload hiện có
+    var (xmpPosition, xmpPayload) = findXMPApp1Marker()
+    SLog.d(TAG, "found xmp pos=$xmpPosition, payload=$xmpPayload required=$requiredSize")
+
+    // Nếu không có vùng XMP hoặc vùng hiện tại không đủ lớn -> reserve
+    if (xmpPayload < requiredSize) {
+        SLog.i(TAG, "existing xmp payload too small or not present: reserving")
+        val box = reserveXMP(maxOf(requiredSize, XMP_RESERVED_SIZE))
+        xmpPosition = box.offset
+        xmpPayload = box.length
+        SLog.d(TAG, "reserved xmp pos=$xmpPosition, payload=${xmpPayload}")
+    }
+
+    // Bây giờ xmpPosition/xmpPayload đảm bảo >= requiredSize
+    uniFile.useOutputFileChannel { ch ->
+        SLog.i(TAG, "write xmp at $xmpPosition w/ size=${xmpBoxBuffer.limit()}")
+        ch.position(xmpPosition)
+
+        // write signature + xmp
+        ch.write(xmpBoxBuffer)
+
+        // nếu payload lớn hơn dữ liệu mới, ghi padding (space ' ' = 0x20). 
+        // Dùng ByteBuffer.wrap để ghi, không dùng một API tuỳ ý.
+        val padSize = xmpPayload.toInt() - requiredSize
+        if (padSize > 0) {
+            val pad = ByteArray(padSize) { 0x20.toByte() } // space padding (the same as your old code)
+            ch.write(ByteBuffer.wrap(pad))
+        }
+
+        // truncate? Không cần thiết nếu reserve đảm bảo kích thước file; nếu bạn rewrite toàn bộ file, truncate tương ứng.
+    }
+}
+
+==============ver2=======
+
+// --- inside writeXMP(...) replacing the problematic block ---
+if (xmpPayload < xmpBoxBuffer.limit()) {
+    // need to reserve a larger slot first
+    reserveXMP(XMP_RESERVED_SIZE).also {
+        xmpPosition = it.offset
+        xmpPayload = it.length
+    }
+}
+
+// sanity checks
+if (xmpPosition <= 0L) {
+    SLog.e(TAG, "writeXMP: invalid xmpPosition=$xmpPosition")
+    throw IllegalStateException("Invalid XMP position")
+}
+
+val payloadSize = xmpBoxBuffer.limit()
+if (payloadSize > xmpPayload) {
+    SLog.e(TAG, "writeXMP: payloadSize=$payloadSize > slotSize=$xmpPayload")
+    throw IllegalStateException("XMP payload bigger than reserved slot")
+}
+
+// write payload + padding safely
+uniFile.useOutputFileChannel { ch ->
+    SLog.i(TAG, "write xmp at payloadOffset=$xmpPosition payloadSize=$payloadSize slotSize=$xmpPayload")
+    ch.position(xmpPosition)
+
+    // ensure buffer ready for writing
+    if (xmpBoxBuffer.hasRemaining().not()) xmpBoxBuffer.rewind()
+
+    // write whole payload (loop until fully written)
+    while (xmpBoxBuffer.hasRemaining()) {
+        val written = ch.write(xmpBoxBuffer)
+        if (written <= 0) {
+            // should not happen with blocking FileChannel, but be defensive
+            throw IllegalStateException("Failed to write XMP payload")
+        }
+    }
+
+    // pad the remaining slot with spaces (0x20) or zeros if you prefer
+    val padSize = (xmpPayload.toInt() - payloadSize)
+    if (padSize > 0) {
+        // allocate a reasonably sized pad buffer; if padSize is huge, write in chunks
+        val CHUNK = 4096
+        var remaining = padSize
+        val padChunk = ByteArray(minOf(CHUNK, remaining)) { 0x20.toByte() } // space padding
+        while (remaining > 0) {
+            val writeNow = minOf(remaining, padChunk.size)
+            ch.write(ByteBuffer.wrap(padChunk, 0, writeNow))
+            remaining -= writeNow
+        }
+    }
+}
+
+==========ver3==========
+
+/**
+ * Rewrite XMP segment in JPEG.
+ * Always keeps SOI + EXIF + (new) XMP + rest of file.
+ */
+private fun rewriteXMP(newXmp: ByteBuffer) {
+    require(newXmp.limit() > 0) { "XMP buffer is empty" }
+
+    uniFile.useInputOutputFileChannel { input, output ->
+        // 1. Copy SOI (0xFFD8)
+        val soi = ByteArray(2)
+        input.read(ByteBuffer.wrap(soi))
+        output.write(ByteBuffer.wrap(soi))
+
+        var exifCopied = false
+        var xmpReplaced = false
+
+        while (true) {
+            val marker = readMarker(input) ?: break
+            val segment = readSegment(input) ?: break
+
+            when {
+                // Keep EXIF as-is
+                marker == JPEG.APP1 && isExif(segment) -> {
+                    output.write(markerBuffer(marker, segment))
+                    exifCopied = true
+                }
+
+                // Skip old XMP (if exists)
+                marker == JPEG.APP1 && isXmp(segment) -> {
+                    if (!xmpReplaced) {
+                        // Insert new XMP right here
+                        output.write(markerBuffer(JPEG.APP1, newXmp))
+                        xmpReplaced = true
+                    }
+                    // skip old
+                }
+
+                else -> {
+                    // For the first APPn after EXIF (if no old XMP)
+                    if (!xmpReplaced && exifCopied) {
+                        output.write(markerBuffer(JPEG.APP1, newXmp))
+                        xmpReplaced = true
+                    }
+                    output.write(markerBuffer(marker, segment))
+                }
+            }
+        }
+
+        // If no EXIF or no place found, insert right after SOI
+        if (!xmpReplaced) {
+            SLog.i(TAG, "insert XMP after SOI (no EXIF found)")
+            // rewind to after SOI
+            output.position(2)
+            output.write(markerBuffer(JPEG.APP1, newXmp))
+            // move rest of data
+            input.position(2)
+            input.transferTo(output.position(), input.size() - 2, output)
+        }
+    }
+}
+
+
+-----------------------------------
+
+private fun readMarker(input: FileChannel): Int? {
+    val b = ByteBuffer.allocate(2)
+    return if (input.read(b) == 2) {
+        ((b[0].toInt() and 0xFF) shl 8) or (b[1].toInt() and 0xFF)
+    } else null
+}
+
+private fun readSegment(input: FileChannel): ByteArray? {
+    val lenBuf = ByteBuffer.allocate(2)
+    if (input.read(lenBuf) != 2) return null
+    val length = ((lenBuf[0].toInt() and 0xFF) shl 8) or (lenBuf[1].toInt() and 0xFF)
+    val data = ByteArray(length - 2)
+    input.read(ByteBuffer.wrap(data))
+    return lenBuf.array() + data
+}
+
+private fun markerBuffer(marker: Int, payload: ByteBuffer): ByteBuffer {
+    val length = payload.limit() + 2
+    val buf = ByteBuffer.allocate(2 + 2 + payload.limit())
+    buf.putShort(marker.toShort())
+    buf.putShort(length.toShort())
+    buf.put(payload.duplicate())
+    buf.flip()
+    return buf
+}
+
+private fun markerBuffer(marker: Int, segment: ByteArray): ByteBuffer {
+    val buf = ByteBuffer.allocate(2 + segment.size)
+    buf.putShort(marker.toShort())
+    buf.put(segment)
+    buf.flip()
+    return buf
+}
+
+private fun isExif(segment: ByteArray): Boolean =
+    segment.size >= 6 && String(segment, 2, 4) == "Exif"
+
+private fun isXmp(segment: ByteArray): Boolean =
+    segment.size >= 29 && String(segment, 2, 29).startsWith("http://ns.adobe.com/xap/1.0/")
+
+
+
+==============ver4======
+/**
+ * Reserve space for XMP by shifting the following data if possible.
+ * Return the new xmpPosition, or -1 if not enough space.
+ */
+private fun reserveXMPByMove(requiredSize: Int): Long {
+    val channel = uniFile.openFileChannel() ?: return -1
+    channel.use { ch ->
+        val fileSize = ch.size()
+        if (xmpPosition <= 0 || xmpPayload >= requiredSize) {
+            // No need to move, reuse
+            return xmpPosition
+        }
+
+        val delta = requiredSize - xmpPayload
+        val tailSize = fileSize - (xmpPosition + xmpPayload)
+
+        // Move tail data to make room
+        val buffer = ByteArray(8192)
+        var readPos = fileSize - 1
+        var writePos = fileSize + delta - 1
+
+        while (readPos >= xmpPosition + xmpPayload) {
+            val step = minOf(buffer.size.toLong(), readPos - (xmpPosition + xmpPayload) + 1).toInt()
+            ch.position(readPos - step + 1)
+            ch.read(ByteBuffer.wrap(buffer, 0, step))
+            ch.position(writePos - step + 1)
+            ch.write(ByteBuffer.wrap(buffer, 0, step))
+
+            readPos -= step
+            writePos -= step
+        }
+
+        // Update payload size metadata (APP1 length)
+        updateAPP1Length(ch, xmpPosition, requiredSize)
+
+        return xmpPosition
+    }
+}
+
+/**
+ * Reserve space for XMP by rewriting the entire file layout.
+ * Always ensures a clean APP1 segment with requiredSize payload.
+ */
+private fun reserveXMPByCopy(requiredSize: Int): Long {
+    val input = uniFile.openFileChannel() ?: return -1
+    val tempFile = createTempFile("xmp_rewrite", ".jpg", uniFile.parentFile)
+    val output = RandomAccessFile(tempFile, "rw").channel
+
+    var newXmpPos: Long = -1
+    input.use { inCh ->
+        output.use { outCh ->
+            val buffer = ByteBuffer.allocate(8192)
+
+            // Step 1: Copy SOI marker (FFD8)
+            inCh.read(buffer.clear().limit(2))
+            buffer.flip()
+            outCh.write(buffer)
+
+            var foundEXIF = false
+            var insertedXMP = false
+
+            // Step 2: Iterate through markers
+            while (true) {
+                buffer.clear().limit(4)
+                if (inCh.read(buffer) < 4) break
+                buffer.flip()
+                val marker = buffer.short.toInt() and 0xFFFF
+                val segLen = buffer.short.toInt() and 0xFFFF
+
+                if (marker == 0xFFE1) {
+                    // APP1 segment (EXIF or XMP or MPF)
+                    val segBuf = ByteBuffer.allocate(segLen - 2)
+                    inCh.read(segBuf)
+                    segBuf.flip()
+
+                    if (!foundEXIF && segBuf.hasRemaining() && looksLikeEXIF(segBuf)) {
+                        // Copy EXIF as is
+                        buffer.rewind()
+                        outCh.write(buffer)
+                        segBuf.rewind()
+                        outCh.write(segBuf)
+                        foundEXIF = true
+
+                        // Insert new XMP immediately after EXIF
+                        newXmpPos = outCh.position()
+                        writeEmptyXMP(outCh, requiredSize)
+                        insertedXMP = true
+                    } else {
+                        // Skip old XMP, copy others
+                        if (!looksLikeXMP(segBuf)) {
+                            buffer.rewind()
+                            outCh.write(buffer)
+                            segBuf.rewind()
+                            outCh.write(segBuf)
+                        }
+                    }
+                } else {
+                    // Non-APP1 marker, rewind 4 bytes and break
+                    inCh.position(inCh.position() - 4)
+                    break
+                }
+            }
+
+            // If no EXIF found and no XMP inserted → insert right after SOI
+            if (!insertedXMP) {
+                newXmpPos = outCh.position()
+                writeEmptyXMP(outCh, requiredSize)
+            }
+
+            // Copy the rest of file
+            buffer.clear()
+            while (inCh.read(buffer) > 0) {
+                buffer.flip()
+                outCh.write(buffer)
+                buffer.clear()
+            }
+        }
+    }
+
+    // Replace original file
+    uniFile.replaceWith(tempFile)
+
+    return newXmpPos
+}
+
+
+-----------------------
+
+private fun updateAPP1Length(ch: FileChannel, pos: Long, payloadSize: Int) {
+    val length = payloadSize + 2 // marker size
+    val buffer = ByteBuffer.allocate(2).putShort(length.toShort())
+    buffer.flip()
+    ch.position(pos - 2) // length field is right after marker
+    ch.write(buffer)
+}
+
+private fun looksLikeEXIF(buf: ByteBuffer): Boolean {
+    val arr = ByteArray(minOf(buf.remaining(), 4))
+    buf.get(arr)
+    buf.rewind()
+    return String(arr).startsWith("Exif")
+}
+
+private fun looksLikeXMP(buf: ByteBuffer): Boolean {
+    val arr = ByteArray(minOf(buf.remaining(), 29))
+    buf.get(arr)
+    buf.rewind()
+    return String(arr).contains("http://ns.adobe.com/xap/1.0/")
+}
+
+private fun writeEmptyXMP(outCh: FileChannel, size: Int) {
+    val header = "http://ns.adobe.com/xap/1.0/\u0000"
+    val totalLen = size + 2 + header.length
+    val buffer = ByteBuffer.allocate(totalLen)
+
+    buffer.putShort(totalLen.toShort()) // APP1 length
+    buffer.put(header.toByteArray(Charsets.US_ASCII))
+    repeat(size - header.length) { buffer.put(0x20) }
+    buffer.flip()
+
+    outCh.write(ByteBuffer.wrap(byteArrayOf(0xFF.toByte(), 0xE1.toByte()))) // APP1 marker
+    outCh.write(buffer)
+}
+
+
+=========ver5===========
+
+override fun writeXMP(xmpInfo: XMPInfo) {
+    if (!xmpInfo.edit().isDirty) {
+        SLog.i(TAG, "xmpInfo is clean, skip write")
+        return
+    }
+
+    val xmp = (xmpInfo as XMPInfoImpl).xmp
+    val xmpBuffer = XMPMetaFactory.serializeToBuffer(xmp, SerializeOptions().apply {
+        omitPacketWrapper = true
+        useCompactFormat = true
+    })
+
+    val signatureArray = XMP_SIGNATURE.toByteArray()
+    val xmpBoxBuffer = ByteBuffer.allocate(xmpBuffer.size + signatureArray.size).apply {
+        put(signatureArray)
+        put(xmpBuffer)
+        flip()
+    }
+
+    var (xmpPosition, xmpPayload) = findXMPApp1Marker()
+    SLog.d(TAG, "found xmp pos=$xmpPosition, size=$xmpPayload")
+
+    when {
+        // case 1: không có XMP, tạo mới
+        xmpPayload == 0L -> {
+            SLog.i(TAG, "no xmp found, insert new one")
+            val requiredSize = xmpBoxBuffer.limit()
+            val app1Buffer = ByteBuffer.allocate(JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE + requiredSize).apply {
+                putShort(JPEG_APP1_MARKER)
+                putShort((requiredSize + JPEG_LENGTH_SIZE).toShort())
+                put(xmpBoxBuffer)
+                flip()
+            }
+
+            val jpegBuffer = uniFile.newInputFileStream().use {
+                it.channel.position(0)
+                ByteBuffer.allocate(it.channel.size().toInt() + app1Buffer.limit()).apply {
+                    // copy SOI
+                    putShort(JPEG_SOI_MARKER)
+                    // insert XMP block
+                    put(app1Buffer)
+                    // copy phần còn lại
+                    val offset = JPEG_MARKER_SIZE.toLong()
+                    it.channel.position(offset)
+                    it.channel.read(this, offset)
+                    flip()
+                }
+            }
+
+            uniFile.useOutputFileChannel {
+                it.position(0)
+                it.write(jpegBuffer)
+                it.truncate(jpegBuffer.limit().toLong())
+            }
+        }
+
+        // case 2: có XMP nhưng chỗ chứa đủ
+        xmpPayload >= xmpBoxBuffer.limit() -> {
+            uniFile.useOutputFileChannel {
+                SLog.i(TAG, "reuse existing xmp at $xmpPosition")
+                it.position(xmpPosition)
+                it.write(xmpBoxBuffer)
+                if (xmpPayload.toInt() > xmpBoxBuffer.limit()) {
+                    it.write(0x20, xmpPayload.toInt() - xmpBoxBuffer.limit())
+                }
+            }
+        }
+
+        // case 3: có XMP nhưng chỗ chứa không đủ
+        else -> {
+            SLog.i(TAG, "xmp block too small, reserve new")
+            reserveXMP(XMP_RESERVED_SIZE).also {
+                xmpPosition = it.offset
+                xmpPayload = it.length
+            }
+            uniFile.useOutputFileChannel {
+                it.position(xmpPosition)
+                it.write(xmpBoxBuffer)
+                it.write(0x20, (xmpPayload.toInt() - xmpBoxBuffer.limit()).coerceAtLeast(0))
+            }
+        }
+    }
+}
+----------
+
+private fun reserveXMPByCopy(size: Int): ReservedXMP {
+    return when (metaType) {
+        MetaType.JPEG -> {
+            SLog.i(TAG, "reserveXMPByCopy JPEG, size=$size")
+
+            val xmpBoxBuffer = ByteBuffer.allocate(size).apply {
+                put(XMP_SIGNATURE.toByteArray())
+                flip()
+            }
+
+            val app1Buffer = ByteBuffer.allocate(JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE + size).apply {
+                putShort(JPEG_APP1_MARKER)
+                putShort((size + JPEG_LENGTH_SIZE).toShort())
+                put(xmpBoxBuffer)
+                flip()
+            }
+
+            val jpegBuffer = uniFile.newInputFileStream().use { input ->
+                val ch = input.channel
+                ch.position(0)
+
+                // allocate (old size + new APP1)
+                ByteBuffer.allocate(ch.size().toInt() + app1Buffer.limit()).apply {
+                    // copy SOI
+                    putShort(JPEG_SOI_MARKER)
+
+                    // insert new APP1 (XMP)
+                    put(app1Buffer)
+
+                    // copy phần còn lại (từ sau SOI cũ)
+                    val offset = JPEG_MARKER_SIZE.toLong()
+                    ch.position(offset)
+                    ch.read(this, offset)
+
+                    flip()
+                }
+            }
+
+            uniFile.useOutputFileChannel {
+                it.position(0)
+                it.write(jpegBuffer)
+                it.truncate(jpegBuffer.limit().toLong())
+            }
+
+            ReservedXMP(JPEG_MARKER_SIZE + JPEG_LENGTH_SIZE, size.toLong())
+        }
+
+        MetaType.HEIF -> {
+            SLog.i(TAG, "reserveXMPByCopy HEIF, size=$size")
+
+            val parser = ISOBoxParser(uniFile.newInputFileStream())
+            val file = parser.parse()
+            val meta = file.getBoxes("meta").firstOrNull()
+                ?: throw IllegalStateException("meta box not found")
+
+            // thêm entry mới cho XMP
+            val iinf = meta.getOrCreateChild("iinf")
+            val newId = iinf.addInfe("application/rdf+xml") // XMP MIME
+            val moov = file.getBoxes("moov").first()
+            val uuid = moov.addUUIDBox(size, XMP_UUID, newId)
+
+            uniFile.useOutputFileChannel {
+                parser.write(file, it)
+            }
+
+            ReservedXMP(uuid.offset, uuid.length)
+        }
+
+        else -> throw UnsupportedOperationException("reserveXMPByCopy not supported for $metaType")
+    }
+}
+=============ver6=====
+
