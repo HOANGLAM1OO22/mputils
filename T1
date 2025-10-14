@@ -1,0 +1,137 @@
+void SEFInfoImpl::load() {
+    ALOGI("load E");
+    lastImageSize = file->size();
+    file->position(0);
+
+    if (lastImageSize < 4) {
+        ALOGI("no end of sef-tail marker: %s", file->getPath().c_str());
+        return;
+    }
+
+    // --- Check SEFT tail marker ---
+    file->position(file->size() - 4);
+    if (!file->matched(SEF_TAIL_SIGNATURE)) {
+        ALOGE("no end of sef-tail marker: %s", file->getPath().c_str());
+        return;
+    }
+
+    // --- Read TailHeaderOffset (distance from SEFT to SEFH) ---
+    file->position(file->size() - 8);
+    int sefTailStartSignatureOffset = file->readBySwap<int, int>() + 8;
+
+    // HEIC specific fix: remove 8 bytes of "sefd" box header
+    if (file->mimeType() == IMAGE_HEIC) {
+        sefTailStartSignatureOffset -= 8;
+        ALOGI("HEIC detected, adjusted sefTailStartSignatureOffset=%d", sefTailStartSignatureOffset);
+    }
+
+    // Validate offset range
+    if (sefTailStartSignatureOffset <= 0 || sefTailStartSignatureOffset > file->size()) {
+        throwError("invalid sefTailStartSignatureOffset=%d, file=%zu",
+                   sefTailStartSignatureOffset, file->size());
+    }
+
+    // --- Move to SEFH start ---
+    file->position(file->size() - sefTailStartSignatureOffset);
+    if (!file->matched(SEF_TAIL_START_SIGNATURE)) {
+        ALOGE("no start of sef-tail marker (SEFH)");
+        return;
+    }
+
+    // --- Read version & data count ---
+    auto ints = file->read<int>(2);
+    version = ints[0];
+    int dataCount = ints[1];
+    ALOGI("SEF version: %d, # of data: %d", version, dataCount);
+
+    // --- Read each SEFDataInfo header ---
+    std::vector<SEFDataInfo> parsedInfos;
+    parsedInfos.reserve(dataCount);
+
+    for (int i = 0; i < dataCount; i++) {
+        auto hdr = file->read<int>(3);
+        int header = hdr[0];
+        int offset = hdr[1];
+        int length = hdr[2];
+
+        if (length < 8) {
+            throwError("Invalid data length=%d at index=%d", length, i);
+        }
+
+        parsedInfos.push_back(SEFDataInfo{
+            .type = getTypeFromHeader(header),
+            .hasSubInfo = hasSubInfoOnHeader(header),
+            .offsetFromTail = offset,
+            .payload = length
+        });
+    }
+
+    // --- Compute dataOffsetFromEnd ---
+    dataOffsetFromEnd = sefTailStartSignatureOffset + std::max_element(
+        parsedInfos.begin(), parsedInfos.end(),
+        [](const auto& a, const auto& b) {
+            return a.offsetFromTail < b.offsetFromTail;
+        }
+    )->offsetFromTail;
+
+    // --- Compute lastImageSize (actual image payload before SEF) ---
+    lastImageSize -= dataOffsetFromEnd;
+    if (file->mimeType() == IMAGE_HEIC) {
+        // subtract box header "sefd"
+        lastImageSize -= 8;
+    }
+
+    ALOGI("lastImageSize=%zu, dataOffsetFromEnd=%d, sefTailStartSignatureOffset=%d",
+          lastImageSize, dataOffsetFromEnd, sefTailStartSignatureOffset);
+
+    tailSize = sefTailStartSignatureOffset;
+
+    // --- Parse each data block ---
+    for (auto& data : parsedInfos) {
+        file->position(file->size() - (sefTailStartSignatureOffset + data.offsetFromTail));
+
+        auto ints2 = file->read<int>(2);
+        int header = ints2[0];
+        int nameLen = ints2[1];
+
+        check(data.type == getTypeFromHeader(header), "type mismatch");
+        check(data.hasSubInfo == hasSubInfoOnHeader(header), "hasSubInfo mismatch");
+
+        if (data.hasSubInfo) {
+            data.subInfoPayload = file->read<int>();
+        } else {
+            data.subInfoPayload = 0;
+        }
+
+        auto chars = file->read<char>(nameLen);
+        data.name = std::string(chars.begin(), chars.end());
+
+        data.dataPosition = file->position();
+        data.dataPayload = data.payload - 8 - data.name.size();
+
+        if (data.dataPayload < 0) {
+            ALOGE("invalid dataPayload=%d, name=%s", data.dataPayload, data.name.c_str());
+            throwError("invalid data payload=%d", data.dataPayload);
+        }
+
+        if (data.hasSubInfo) {
+            data.subInfoPosition = file->position();
+            data.dataPayload -= 4 + data.subInfoPayload;
+            data.dataPosition += data.subInfoPayload;
+        }
+
+        ALOGI("parsed data[%d]: type=%d, offsetFromTail=%d, payload=%d, dataPayload=%d, name=%s",
+              i, data.type, data.offsetFromTail, data.payload, data.dataPayload, data.name.c_str());
+    }
+
+    // --- Commit parsed data ---
+    this->dataInfos.clear();
+    this->dataInfos.insert(this->dataInfos.end(), parsedInfos.begin(), parsedInfos.end());
+
+    // --- Run handlers (like MotionPhoto parser) ---
+    for (auto& handler : dataHandlers) {
+        handler(file, this->dataInfos);
+    }
+
+    ALOGI("load X");
+}
