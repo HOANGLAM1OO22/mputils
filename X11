@@ -1,0 +1,95 @@
+Metadata HEIFMetaReader::getXMP() {
+    return getMeta(xmpIds);
+}
+
+Metadata HEIFMetaReader::getExif() {
+    auto meta = getMeta(exifIds);
+    if (meta.position == 0) return meta;
+
+    auto bytes = meta.byteReader(meta.position, 4);
+    if (bytes.size() == 4) {
+        int tiffOffset = (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
+        if (tiffOffset >= 6) {
+            size_t exifOffset = 4 + tiffOffset - 6;
+            meta.position += exifOffset;
+            meta.payload -= exifOffset;
+        }
+    }
+    return meta;
+}
+
+Metadata HEIFMetaReader::getCameraDebugInfo() {
+    return cameraDebugInfo;
+}
+mmmmmmmmm
+
+void HEIFMetaReader::parseMetaBox() {
+    // Find top-level 'meta' box and parse sub-boxes
+    auto metas = findBox({HEIF_META_BOX});
+    if (metas.empty()) return;
+
+    const auto& meta = metas.front();
+    off64_t metaStart = meta.position + 8; // skip size+type
+    off64_t metaEnd   = metaStart + meta.size - 8;
+
+    ::lseek64(fd, metaStart, SEEK_SET);
+    off64_t pos = metaStart + 4; // skip full-box header
+
+    while (pos < metaEnd) {
+        ::lseek64(fd, pos, SEEK_SET);
+        uint32_t boxSize = 0;
+        ::read(fd, &boxSize, 4);
+        boxSize = ntohl(boxSize);
+        char type[5] = {0};
+        ::read(fd, type, 4);
+        std::string boxType(type, 4);
+
+        if (boxType == HEIF_IINF_BOX) parseIINFBox(fd, boxSize - 8);
+        else if (boxType == HEIF_PITM_BOX) parsePITMBox(fd, boxSize - 8);
+        else if (boxType == HEIF_IREF_BOX) parseIREFBox(fd, boxSize - 8);
+        else if (boxType == HEIF_ILOC_BOX) parseILOCBox(fd, boxSize - 8);
+        else ::lseek64(fd, boxSize - 8, SEEK_CUR);
+
+        pos += boxSize;
+    }
+}
+
+void HEIFMetaReader::parseFreeBoxForCdif() {
+    auto frees = findBox({HEIF_FREE_BOX});
+    for (const auto& b : frees) {
+        size_t tagPos = b.position + 8;
+        if (::lseek64(fd, tagPos, SEEK_SET) < 0) continue;
+        char tag[5] = {0};
+        ::read(fd, tag, 4);
+        std::string tagStr(tag, 4);
+        if (tagStr == HEIF_CDIF_BOX) {
+            Metadata m{};
+            m.type = META_CAMERA_DEBUG;
+            m.position = b.position + 12; // skip size(4) + type(4) + 'cdif'(4)
+            m.payload  = b.size - 12;
+            m.byteReader = byteReader;
+            cameraDebugInfo = m; // store for getCameraDebugInfo()
+            ALOGI("Found Camera Debug Info at %zu size=%zu", m.position, m.payload);
+            return;
+        }
+    }
+}
+mm...
+HEIFMetaReader::HEIFMetaReader(const std::shared_ptr<MediaFile>& file)
+    : ImageMetaReader(file) {
+    fd = file->getFd();
+    size = file->size();
+    check(size > 0, "fail to open input file, err(%d,%s)", errno, GET_ERROR_MSG(errno));
+
+    if (init(fd) != OK) {
+        throw std::runtime_error("[HEIFMetaReader]init fail");
+    }
+
+    // 🟢 After demuxer ready, we manually parse metadata boxes
+    try {
+        parseMetaBox(); // new function for XMP/EXIF parsing
+        parseFreeBoxForCdif(); // new function for Camera Debug Info
+    } catch (const std::exception& e) {
+        ALOGW("HEIFMetaReader: custom metadata parse failed: %s", e.what());
+    }
+}
