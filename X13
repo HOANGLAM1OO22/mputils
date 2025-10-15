@@ -1,0 +1,132 @@
+void HEIFMetaReader::parseILOCBox(const std::shared_ptr<MediaFile>& file, size_t boxSize) {
+    boxes[HEIF_ILOC_BOX] = Metadata{ file->position(), boxSize, byteReader };
+
+    // BE readers
+    auto r2 = [&]()->uint32_t { auto v=file->read(2); return (v[0]<<8)|v[1]; };
+    auto r4 = [&]()->uint32_t { auto v=file->read(4); return (v[0]<<24)|(v[1]<<16)|(v[2]<<8)|v[3]; };
+    auto r8 = [&]()->uint64_t { auto v=file->read(8);
+        return (uint64_t(v[0])<<56)|(uint64_t(v[1])<<48)|(uint64_t(v[2])<<40)|(uint64_t(v[3])<<32)|
+               (uint64_t(v[4])<<24)|(uint64_t(v[5])<<16)|(uint64_t(v[6])<<8)|uint64_t(v[7]); };
+
+    const uint32_t header = r4();
+    const uint8_t version = uint8_t(header >> 24);
+    if (version > 2) throw std::runtime_error("iloc version > 2 not supported");
+
+    const uint16_t tmp = r2();
+    const uint8_t offsetSize = (tmp >> 12) & 0xF;
+    const uint8_t lengthSize = (tmp >> 8) & 0xF;
+
+    const uint16_t tmp2 = r2();
+    const uint8_t baseOffsetSize = (tmp2 >> 12) & 0xF;
+    const uint8_t indexSize = (tmp2 >> 8) & 0xF;
+
+    auto readItemId = [&]() -> int {
+        return (version < 2) ? int(r2()) : int(r4());
+    };
+
+    auto readOffsetLen = [&](uint8_t sz)->uint64_t {
+        switch (sz) {
+            case 0: return 0;
+            case 4: return r4();
+            case 8: return r8();
+            default: throw std::runtime_error("iloc: invalid size");
+        }
+    };
+
+    const int itemCount = readItemId();
+
+    for (int i = 0; i < itemCount; ++i) {
+        const int itemId = readItemId();
+        if (version == 1 || version == 2) file->skip(2);  // construction_method
+        file->skip(2); // data_reference_index
+
+        const uint64_t baseOffset = readOffsetLen(baseOffsetSize);
+        const uint16_t extentCount = r2();
+        if (extentCount != 1) throw std::runtime_error("iloc: multi-extent not supported");
+
+        if ((version == 1 || version == 2) && indexSize > 0) file->skip(4);
+
+        const uint64_t extentOffset = readOffsetLen(offsetSize);
+        const uint64_t extentLength = readOffsetLen(lengthSize);
+
+        ItemLocation loc;
+        loc.id = itemId;
+        loc.baseOffset = baseOffset;
+        loc.extentOffset = extentOffset;
+        loc.extentLength = extentLength;
+        locations.push_back(loc);
+
+        ALOGV("iloc: item=%d base=%llu extOff=%llu len=%llu",
+              itemId, (unsigned long long)baseOffset,
+              (unsigned long long)extentOffset,
+              (unsigned long long)extentLength);
+    }
+}
+
+
+
+void HEIFMetaReader::parseIREFBox(const std::shared_ptr<MediaFile>& file, size_t boxSize) {
+    boxes[HEIF_IREF_BOX] = Metadata{ file->position(), boxSize, byteReader };
+
+    // BE readers
+    auto r2 = [&]()->uint32_t { auto v=file->read(2); return (v[0]<<8)|v[1]; };
+    auto r4 = [&]()->uint32_t { auto v=file->read(4); return (v[0]<<24)|(v[1]<<16)|(v[2]<<8)|v[3]; };
+
+    const uint32_t header = r4(); 
+    const uint8_t version = uint8_t(header >> 24);
+
+    auto readItemId = [&]() -> int {
+        return (version == 0) ? int(r2()) : int(r4());
+    };
+
+    size_t start = file->position();
+    while (file->position() - start < boxSize) {
+        const uint32_t chunkSize = r4();
+        const std::string chunkType = file->readString(4);
+        if (chunkSize < 8) break;
+
+        if (chunkType == HEIF_CDSC_BOX) {
+            int from = readItemId();
+            file->skip(2);                // skip 2 reserved bytes
+            int to = readItemId();
+
+            ItemReference ref;
+            ref.id = from;
+            ref.add(to);
+            references.push_back(ref);
+            ALOGV("iref: %d -> %d", from, to);
+
+            size_t consumed = 8 + ((version==0)?2:4) + 2 + ((version==0)?2:4);
+            if (chunkSize > consumed) file->skip(chunkSize - consumed);
+        } else {
+            file->skip(chunkSize - 8);
+        }
+    }
+}
+
+
+
+void HEIFMetaReader::parsePITMBox(const std::shared_ptr<MediaFile>& file, size_t boxSize) {
+    boxes[HEIF_PITM_BOX] = Metadata{ file->position(), boxSize, byteReader };
+
+    // local BE readers
+    auto r2 = [&]()->uint32_t {
+        auto v = file->read(2);
+        return (uint32_t(v[0]) << 8) | uint32_t(v[1]);
+    };
+    auto r4 = [&]()->uint32_t {
+        auto v = file->read(4);
+        return (uint32_t(v[0]) << 24) | (uint32_t(v[1]) << 16) | (uint32_t(v[2]) << 8) | uint32_t(v[3]);
+    };
+
+    const uint32_t header = r4();          // version+flags
+    const uint8_t version = uint8_t(header >> 24);
+
+    coverImageId = (version == 0) ? int(r2()) : int(r4());
+
+    // skip remains if any
+    size_t consumed = (version == 0) ? 6 : 8;
+    if (boxSize > consumed) file->skip(boxSize - consumed);
+
+    ALOGV("pitm: coverImageId=%d", coverImageId);
+}
