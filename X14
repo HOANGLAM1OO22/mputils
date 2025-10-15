@@ -1,0 +1,95 @@
+void HEIFMetaReader::parseILOCBox(const std::shared_ptr<MediaFile>& file, size_t boxSize) {
+    boxes[HEIF_ILOC_BOX] = Metadata{ file->position(), boxSize, byteReader };
+
+    // --- local BE readers (scoped) ---
+    auto r1 = [&]()->uint8_t {
+        auto v = file->read(1);
+        if (v.size() != 1) throw std::runtime_error("iloc: read u8 failed");
+        return v[0];
+    };
+    auto r2 = [&]()->uint32_t {
+        auto v = file->read(2);
+        if (v.size() != 2) throw std::runtime_error("iloc: read u16 failed");
+        return (uint32_t(v[0]) << 8) | uint32_t(v[1]);
+    };
+    auto r4 = [&]()->uint32_t {
+        auto v = file->read(4);
+        if (v.size() != 4) throw std::runtime_error("iloc: read u32 failed");
+        return (uint32_t(v[0]) << 24) | (uint32_t(v[1]) << 16) | (uint32_t(v[2]) << 8) | uint32_t(v[3]);
+    };
+    auto r8 = [&]()->uint64_t {
+        auto v = file->read(8);
+        if (v.size() != 8) throw std::runtime_error("iloc: read u64 failed");
+        return (uint64_t(v[0])<<56)|(uint64_t(v[1])<<48)|(uint64_t(v[2])<<40)|(uint64_t(v[3])<<32)|
+               (uint64_t(v[4])<<24)|(uint64_t(v[5])<<16)|(uint64_t(v[6])<<8)|uint64_t(v[7]);
+    };
+    auto readItemId = [&](uint8_t version)->int {
+        return (version < 2) ? int(r2()) : int(r4());
+    };
+    auto readOffsetLen = [&](uint8_t sz)->uint64_t {
+        switch (sz) {
+            case 0: return 0;
+            case 4: return r4();
+            case 8: return r8();
+            default: throw std::runtime_error("iloc: invalid size nibble");
+        }
+    };
+
+    const size_t startPos = file->position();
+
+    // FullBox header (version+flags)
+    const uint32_t header = r4();
+    const uint8_t  version = uint8_t(header >> 24);
+    if (version > 2) throw std::runtime_error("iloc: version > 2 not supported");
+
+    // *** IMPORTANT: read two BYTES, not a 16-bit and bit-shift ***
+    const uint8_t b0 = r1(); // lengthOffsetSize
+    const uint8_t b1 = r1(); // baseOffsetIndexSize
+
+    const uint8_t offsetSize     = uint8_t(b0 >> 4);
+    const uint8_t lengthSize     = uint8_t(b0 & 0x0F);
+    const uint8_t baseOffsetSize = uint8_t(b1 >> 4);
+    const uint8_t indexSize      = (version == 1 || version == 2) ? uint8_t(b1 & 0x0F) : 0;
+
+    // item_count
+    const int itemCount = readItemId(version);
+
+    for (int i = 0; i < itemCount; ++i) {
+        const int itemId = readItemId(version);
+
+        if (version == 1 || version == 2) {
+            // construction_method is 4 bits in a 16-bit field; spec puts it here as u16
+            file->skip(2);
+        }
+
+        // data_reference_index (u16)
+        file->skip(2);
+
+        const uint64_t baseOffset = readOffsetLen(baseOffsetSize);
+
+        const uint16_t extentCount = r2();   // BE u16
+        // Kotlin assumes 1; we enforce the same for this implementation
+        if (extentCount != 1) {
+            throw std::runtime_error("iloc: multi-extent not supported by this reader");
+        }
+
+        if ((version == 1 || version == 2) && indexSize > 0) {
+            // extent_index (u32) if indexSize > 0 per spec; Kotlin skips 4
+            file->skip(4);
+        }
+
+        const uint64_t extentOffset = readOffsetLen(offsetSize);
+        const uint64_t extentLength = readOffsetLen(lengthSize);
+
+        ItemLocation loc;
+        loc.id = itemId;
+        loc.baseOffset   = size_t(baseOffset);
+        loc.extentOffset = size_t(extentOffset);
+        loc.extentLength = size_t(extentLength);
+        locations.push_back(loc);
+    }
+
+    // align to end of this iloc box if anything remains
+    const size_t consumed = file->position() - startPos;
+    if (boxSize > consumed) file->skip(boxSize - consumed);
+}
