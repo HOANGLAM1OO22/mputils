@@ -1,0 +1,98 @@
+#include "HEIFMetaReader.hpp"
+#include "Metadata.hpp"
+#include "Log.hpp"
+#include <arpa/inet.h>
+
+namespace android::vcore {
+
+// --------------------------------------------------
+// Helper: parse sub-boxes inside the "meta" box
+// --------------------------------------------------
+Metadata HEIFMetaReader::getMeta(const std::string& metaType) {
+    // 1️⃣ Find the "meta" box
+    auto metaBoxes = findBox({HEIF_META_BOX});
+    if (metaBoxes.empty()) {
+        ALOGW("getMeta: no meta box found in HEIF");
+        return Metadata{};
+    }
+
+    const auto& meta = metaBoxes.front();
+    size_t metaStart = meta.position + 8;  // skip size+type
+    size_t metaEnd   = meta.position + meta.size;
+
+    ::lseek64(fd, metaStart, SEEK_SET);
+
+    Metadata found{};
+    uint32_t subSize = 0;
+    char type[5] = {0};
+
+    // 2️⃣ Iterate through sub-boxes inside "meta"
+    while (::lseek64(fd, 0, SEEK_CUR) < (off_t)metaEnd) {
+        if (::read(fd, &subSize, 4) < 4) break;
+        subSize = ntohl(subSize);
+        if (::read(fd, type, 4) < 4) break;
+        std::string chunkType(type, 4);
+
+        if (subSize < 8) break;
+        size_t subPos = ::lseek64(fd, 0, SEEK_CUR);
+
+        // 3️⃣ Match target metadata type (e.g., "Exif" or "mime")
+        if (chunkType == metaType) {
+            found.type = (metaType == HEIF_EXIF_BOX) ? META_EXIF : META_XMP;
+            found.position = subPos;
+            found.payload  = subSize - 8;
+            found.byteReader = byteReader;
+            ALOGI("getMeta: found %s box at pos=%zu size=%zu",
+                  chunkType.c_str(), found.position, found.payload);
+            break;
+        }
+
+        // Skip to next sub-box
+        ::lseek64(fd, subPos + subSize - 8, SEEK_SET);
+    }
+
+    return found;
+}
+
+// --------------------------------------------------
+// XMP reader (calls getMeta("mime"))
+// --------------------------------------------------
+Metadata HEIFMetaReader::getXMP() {
+    ALOGI("getXMP: locating XMP/MIME box");
+    return getMeta(HEIF_MIME_BOX);  // "mime"
+}
+
+// --------------------------------------------------
+// EXIF reader (calls getMeta("Exif") and adjust TIFF offset)
+// --------------------------------------------------
+Metadata HEIFMetaReader::getExif() {
+    ALOGI("getExif: locating EXIF box");
+    Metadata meta = getMeta(HEIF_EXIF_BOX);
+    if (meta.payload == 0 || meta.position == 0) {
+        ALOGW("getExif: EXIF box not found");
+        return Metadata{};
+    }
+
+    // Read first 4 bytes → TIFF offset
+    auto bytes = meta.byteReader(meta.position, 4);
+    if (bytes.size() == 4) {
+        uint32_t tiffOffset = ntohl(*reinterpret_cast<uint32_t*>(bytes.data()));
+        if (tiffOffset >= 6) {
+            size_t exifOffset = 4 + tiffOffset - 6;
+            ALOGI("getExif: adjust offset=%zu (tiffOffset=%u)", exifOffset, tiffOffset);
+            meta.position += exifOffset;
+            meta.payload  -= exifOffset;
+        }
+    } else {
+        ALOGW("getExif: unable to read TIFF offset");
+    }
+
+    return meta;
+}
+
+} // namespace android::vcore
+
+Metadata getMeta(const std::string& metaType);
+Metadata getXMP() override;
+Metadata getExif() override;
+
