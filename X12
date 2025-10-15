@@ -1,0 +1,88 @@
+void HEIFMetaReader::parseIINFBox(const std::shared_ptr<MediaFile>& file, size_t boxSize) {
+    // store the iinf box for debugging/inspection (like Kotlin boxes[...] = Box(...))
+    boxes[HEIF_IINF_BOX] = Metadata{ file->position(), boxSize, byteReader };
+
+    // ---- Big-endian readers scoped to this function ----
+    auto r2 = [&]()->uint32_t {                     // BE uint16 -> host uint32
+        auto v = file->read(2);
+        if (v.size() != 2) throw std::runtime_error("iinf: read u16 failed");
+        return (uint32_t(v[0]) << 8) | uint32_t(v[1]);
+    };
+    auto r4 = [&]()->uint32_t {                     // BE uint32 -> host
+        auto v = file->read(4);
+        if (v.size() != 4) throw std::runtime_error("iinf: read u32 failed");
+        return (uint32_t(v[0]) << 24) | (uint32_t(v[1]) << 16) | (uint32_t(v[2]) << 8) | uint32_t(v[3]);
+    };
+    auto rtag = [&]()->std::string {                // 4CC
+        return file->readString(4);
+    };
+    auto remainSkip = [&](size_t boxStart, uint32_t sizeBE) {
+        size_t consumed = file->position() - boxStart;
+        if (sizeBE < consumed) return; // malformed guard
+        size_t toSkip = sizeBE - consumed;
+        if (toSkip) file->skip(toSkip);
+    };
+
+    // ---- FullBox header (version + flags) ----
+    const size_t iinfStart = file->position();
+    const uint32_t header = r4();
+    const uint8_t  version = uint8_t(header >> 24);
+
+    // entry_count (u16 if v0, u32 otherwise) — BIG ENDIAN
+    const uint32_t entryCount = (version == 0) ? r2() : r4();
+
+    // parse each 'infe' (Item Info Entry)
+    for (uint32_t i = 0; i < entryCount; ++i) {
+        const size_t entryStart = file->position();
+
+        const uint32_t infeSize = r4();    // BE
+        const std::string infeType = rtag();
+        if (infeSize < 8) {                // minimal box header
+            // malformed; try to bail safely
+            break;
+        }
+
+        if (infeType != HEIF_INFE_BOX) {
+            // skip non-infe entries inside iinf
+            file->skip(infeSize - 8);
+            continue;
+        }
+
+        // 'infe' is a FullBox
+        const uint32_t h2 = r4();                 // version/flags
+        const uint8_t  v2 = uint8_t(h2 >> 24);
+        if (v2 < 2) {
+            // per Kotlin: require(version >= 2)
+            // skip the rest of this infe safely
+            remainSkip(entryStart, infeSize);
+            continue;
+        }
+
+        // item_ID (u16 if v2==2, else u32) — BIG ENDIAN
+        const uint32_t itemId = (v2 == 2) ? r2() : r4();
+
+        // item_protection_index (u16, BE)
+        (void)r2();
+
+        // item_type (4CC)
+        const std::string itemType = rtag();
+
+        // classify
+        if (itemType == HEIF_MIME_BOX) {
+            xmpIds.push_back(int(itemId));
+            ALOGV("iinf: XMP itemId=%u", itemId);
+        } else if (itemType == HEIF_EXIF_BOX) {
+            exifIds.push_back(int(itemId));
+            ALOGV("iinf: EXIF itemId=%u", itemId);
+        } else {
+            // other types ignored
+        }
+
+        // skip any remaining bytes of this infe box
+        remainSkip(entryStart, infeSize);
+    }
+
+    // ensure we don’t overrun iinf
+    const size_t consumed = file->position() - iinfStart;
+    if (consumed < boxSize) file->skip(boxSize - consumed);
+}
