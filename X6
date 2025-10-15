@@ -1,0 +1,300 @@
+private:
+    // === Internal HEIF metadata relationship structs (mirroring Kotlin) ===
+
+    struct ItemReference {
+        int id = 0;
+        std::vector<int> items; // referenced item IDs
+
+        // add a target item ID
+        void add(int targetId) {
+            items.push_back(targetId);
+        }
+
+        // get referenced item by index
+        int get(size_t index) const {
+            return (index < items.size()) ? items[index] : -1;
+        }
+    };
+
+    struct ItemLocation {
+        int id = 0;
+        size_t baseOffset = 0;
+        size_t extentOffset = 0;
+        size_t extentLength = 0;
+
+        inline size_t offset() const { return baseOffset + extentOffset; }
+        inline size_t length() const { return extentLength; }
+    };
+
+    // parsed relationships (same fields as Kotlin)
+    int coverImageId = 0;
+    std::vector<int> xmpIds;
+    std::vector<int> exifIds;
+    std::vector<ItemReference> references;
+    std::vector<ItemLocation> locations;
+
+    // === Parsing helpers ===
+    void parseMetaBox();
+    void parseIINFBox(int fd, size_t boxSize);
+    void parseIREFBox(int fd, size_t boxSize);
+    void parsePITMBox(int fd, size_t boxSize);
+    void parseILOCBox(int fd, size_t boxSize);
+    Metadata getMeta(const std::vector<int>& metaIds);
+
+
+
+//#define LOG_NDEBUG 0
+#define LOG_TAG "HEIFMetaReader"
+
+#include "HEIFMetaReader.hpp"
+#include "MediaFile.hpp"
+#include <sum/Log.hpp>
+#include <sum/Def.hpp>
+
+#include <algorithm>
+#include <stdexcept>
+#include <memory>
+#include <string>
+#include <vector>
+#include <numeric>
+
+namespace android::vcore {
+
+HEIFMetaReader::HEIFMetaReader(const std::shared_ptr<MediaFile>& file)
+    : ImageMetaReader(file) {
+
+    file->position(0);
+
+    try {
+        while (!boxes.count(HEIF_IINF_BOX) ||
+               !boxes.count(HEIF_PITM_BOX) ||
+               !boxes.count(HEIF_IREF_BOX) ||
+               !boxes.count(HEIF_ILOC_BOX) ||
+               !boxes.count(HEIF_FREE_BOX)) {
+
+            auto boxSize = file->read<int>() - 8;
+            if (boxSize <= 0) break;
+
+            auto type = file->readString(4);
+            if (type == HEIF_META_BOX) {
+                file->skip(4); // full-box header (version + flags)
+            } else if (type == HEIF_IINF_BOX) {
+                parseIINFBox(file, boxSize);
+            } else if (type == HEIF_PITM_BOX) {
+                parsePITMBox(file, boxSize);
+            } else if (type == HEIF_IREF_BOX) {
+                parseIREFBox(file, boxSize);
+            } else if (type == HEIF_ILOC_BOX) {
+                parseILOCBox(file, boxSize);
+            } else if (type == HEIF_MPVD_BOX) {
+                boxes[HEIF_MPVD_BOX] = { file->position(), (size_t)boxSize, byteReader };
+                file->skip(boxSize);
+            } else if (type == HEIF_FREE_BOX) {
+                parseFreeBox(file, boxSize);
+            } else {
+                file->skip(boxSize);
+            }
+        }
+    } catch (const std::exception& e) {
+        ALOGE("HEIFMetaReader: parse error: %s", e.what());
+    }
+}
+
+void HEIFMetaReader::parseFreeBox(const std::shared_ptr<MediaFile>& file, size_t boxSize) {
+    if (boxSize >= 4) {
+        auto tagPos = file->position();
+        auto tag = file->readString(4);
+        if (tag == HEIF_CDIF_BOX) {
+            size_t dataOffset = tagPos + 4;
+            size_t dataLen = boxSize - 4;
+            boxes[HEIF_CDIF_BOX] = { dataOffset, dataLen, byteReader };
+        } else {
+            file->skip(boxSize - 4);
+        }
+    } else {
+        file->skip(boxSize);
+    }
+}
+
+void HEIFMetaReader::parseIINFBox(const std::shared_ptr<MediaFile>& file, size_t boxSize) {
+    boxes[HEIF_IINF_BOX] = { file->position(), boxSize, byteReader };
+    int header = file->read<int>();
+    int version = (header >> 24) & 0xFF;
+
+    int entryCount = (version == 0)
+        ? file->read<short>()
+        : file->read<int>();
+
+    for (int i = 0; i < entryCount; ++i) {
+        auto start = file->position();
+        auto chunkSize = file->read<int>();
+        auto chunkType = file->readString(4);
+
+        if (chunkType != HEIF_INFE_BOX) {
+            file->skip(chunkSize - 8);
+            continue;
+        }
+
+        int h2 = file->read<int>();
+        int v2 = (h2 >> 24) & 0xFF;
+        if (v2 < 2) {
+            file->skip(chunkSize - 12);
+            continue;
+        }
+
+        int itemId = (v2 == 2) ? file->read<short>() : file->read<int>();
+        file->skip(2); // item_protection_index
+        auto itemType = file->readString(4);
+
+        if (itemType == HEIF_MIME_BOX) {
+            xmpIds.push_back(itemId);
+        } else if (itemType == HEIF_EXIF_BOX) {
+            exifIds.push_back(itemId);
+        }
+
+        file->skip(chunkSize - (file->position() - start));
+    }
+}
+
+void HEIFMetaReader::parseIREFBox(const std::shared_ptr<MediaFile>& file, size_t boxSize) {
+    auto start = file->position();
+    boxes[HEIF_IREF_BOX] = { start, boxSize, byteReader };
+    int header = file->read<int>();
+    int version = (header >> 24) & 0xFF;
+
+    auto readItemId = [&](void) {
+        return (version == 0) ? file->read<short>() : file->read<int>();
+    };
+
+    while (file->position() - start < boxSize) {
+        auto chunkSize = file->read<int>();
+        auto chunkType = file->readString(4);
+
+        if (chunkType == HEIF_CDSC_BOX) {
+            int from = readItemId();
+            file->skip(2);
+            int to = readItemId();
+
+            ItemReference ref;
+            ref.id = from;
+            ref.add(to);
+            references.push_back(ref);
+        } else {
+            file->skip(chunkSize - 8);
+        }
+    }
+}
+
+void HEIFMetaReader::parsePITMBox(const std::shared_ptr<MediaFile>& file, size_t boxSize) {
+    boxes[HEIF_PITM_BOX] = { file->position(), boxSize, byteReader };
+    int header = file->read<int>();
+    int version = (header >> 24) & 0xFF;
+
+    coverImageId = (version == 0)
+        ? file->read<short>()
+        : file->read<int>();
+}
+
+void HEIFMetaReader::parseILOCBox(const std::shared_ptr<MediaFile>& file, size_t boxSize) {
+    boxes[HEIF_ILOC_BOX] = { file->position(), boxSize, byteReader };
+
+    int header = file->read<int>();
+    int version = (header >> 24) & 0xFF;
+
+    short lsb = file->read<short>();
+    int offsetSize = (lsb >> 12) & 0xF;
+    int lengthSize = (lsb >> 8) & 0xF;
+    short bos = file->read<short>();
+    int baseOffsetSize = (bos >> 12) & 0xF;
+    int indexSize = (bos >> 8) & 0xF;
+
+    auto readItemId = [&]() -> int {
+        return (version < 2) ? file->read<short>() : file->read<int>();
+    };
+
+    auto readOffsetLen = [&](int size) -> long {
+        switch (size) {
+            case 0: return 0;
+            case 4: return file->read<int>();
+            case 8: return file->read<long>();
+            default: throw std::runtime_error("ILOC: invalid offset size");
+        }
+    };
+
+    int itemCount = readItemId();
+    for (int i = 0; i < itemCount; ++i) {
+        int itemId = readItemId();
+        if (version == 1 || version == 2) file->skip(2);
+        file->skip(2);
+        auto baseOffset = readOffsetLen(baseOffsetSize);
+        int extentCount = file->read<short>();
+        if (extentCount != 1) throw std::runtime_error("ILOC: only 1 extent supported");
+
+        if ((version == 1 || version == 2) && indexSize > 0) file->skip(4);
+        auto extentOffset = readOffsetLen(offsetSize);
+        auto extentLength = readOffsetLen(lengthSize);
+
+        ItemLocation loc{ itemId, (size_t)baseOffset, (size_t)extentOffset, (size_t)extentLength };
+        locations.push_back(loc);
+    }
+}
+
+Metadata HEIFMetaReader::getMeta(const std::vector<int>& metaIds) {
+    Metadata meta{};
+    if (metaIds.empty() || coverImageId == 0) return meta;
+
+    for (const auto& ref : references) {
+        if (std::find(metaIds.begin(), metaIds.end(), ref.id) == metaIds.end()) continue;
+        if (ref.items.empty() || ref.items[0] != coverImageId) continue;
+
+        auto it = std::find_if(locations.begin(), locations.end(),
+            [&](const ItemLocation& l) { return l.id == ref.id; });
+        if (it != locations.end()) {
+            meta.type = (&metaIds == &xmpIds) ? META_XMP : META_EXIF;
+            meta.position = it->offset();
+            meta.payload = it->length();
+            meta.byteReader = byteReader;
+            return meta;
+        }
+    }
+    return meta;
+}
+
+Metadata HEIFMetaReader::getXMP() {
+    auto m = getMeta(xmpIds);
+    if (m.position > 0) ALOGI("getXMP: pos=%zu len=%zu", m.position, m.payload);
+    return m;
+}
+
+Metadata HEIFMetaReader::getExif() {
+    auto m = getMeta(exifIds);
+    if (m.position == 0) return m;
+
+    auto bytes = m.byteReader(m.position, 4);
+    if (bytes.size() == 4) {
+        int tiffOffset = (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
+        if (tiffOffset >= 6) {
+            size_t exifOffset = 4 + tiffOffset - 6;
+            m.position += exifOffset;
+            m.payload -= exifOffset;
+        }
+    }
+    return m;
+}
+
+Metadata HEIFMetaReader::getCameraDebugInfo() {
+    auto it = boxes.find(HEIF_CDIF_BOX);
+    if (it == boxes.end()) return Metadata{};
+    auto& b = it->second;
+    Metadata meta{};
+    meta.type = META_CAMERA_DEBUG;
+    meta.position = b.position;
+    meta.payload = b.payload;
+    meta.byteReader = b.byteReader;
+    return meta;
+}
+
+} // namespace android::vcore
+
+
+
