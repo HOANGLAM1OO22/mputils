@@ -1,0 +1,159 @@
+private fun makeConverter(task: VideoTranscodingTask): Operator {
+    // Nếu chỉ cần copy raw buffer
+    if (SemSystemProperties.getBoolean("secmm.motionphoto.convert-to-copy", false)) {
+        return Operator { ibuf, obuf ->
+            val input = ibuf.getTypedData(HardwareBuffer::class.java)
+            val output = obuf.getTypedData(HardwareBuffer::class.java)
+            SLog.i(TAG, "copy hwbuffer: ${input.width}x${input.height}")
+            SharedBufferManager.copyHwBufferToHwBuffer(input, output)
+            obuf
+        }
+    }
+
+    // --- chuẩn bị tham số ---
+    val needRotate = task.getRotation() != task.getTranscodingRotation()
+    val targetW = task.getTranscodingVideoWidth()
+    val targetH = task.getTranscodingVideoHeight()
+
+    val srcW = task.getVideoWidth()
+    val srcH = task.getVideoHeight()
+
+    val (rotW, rotH) = if (needRotate && task.isRatioChangedAfterRotate())
+        srcH to srcW else srcW to srcH
+
+    val scaleF = maxOf(
+        targetW.toFloat() / rotW,
+        targetH.toFloat() / rotH
+    )
+
+    val needResize = scaleF != 1f
+    val needCrop = (rotW.toFloat() / rotH) != task.getTranscodingVideoRatio()
+
+    SLog.i(TAG, """makeConverter:
+        | needRotate=$needRotate,
+        | needResize=$needResize,
+        | needCrop=$needCrop,
+        | src=${srcW}x${srcH}, rot=${rotW}x${rotH}, dst=${targetW}x${targetH}, scale=$scaleF
+    """.trimToOneLine())
+
+    val converters = mutableListOf<ImgpConverter>()
+    if (needRotate) converters += ImgpConverter(UniImgp.ofRotate())
+    if (needResize) converters += ImgpConverter(UniImgp.ofResize())
+    if (needCrop) converters += ImgpConverter(UniImgp.ofCrop())
+
+    // --- helper clamp crop ---
+    fun computeCropRectSafe(inW: Int, inH: Int, outW: Int, outH: Int): Rect {
+        val w = minOf(outW, inW)
+        val h = minOf(outH, inH)
+        val x = maxOf(0, (inW - w) / 2)
+        val y = maxOf(0, (inH - h) / 2)
+        return Rect(x, y, x + w, y + h)
+    }
+
+    // --- converter chain ---
+    return Operator { ibuf, obuf ->
+        var input = ibuf
+        var output = obuf
+
+        for ((index, converter) in converters.withIndex()) {
+            val lastStage = index == converters.lastIndex
+
+            output = when (converter.imgpType) {
+
+                ImgpType.ROTATE -> {
+                    SLog.i(TAG, "--- ROTATE ---")
+                    MediaBuffer.newImageAlloc().apply {
+                        val newFmt = input.format.toMutableFormat().apply {
+                            setCols(input.format.rows)
+                            setRows(input.format.cols)
+                            setRotation(
+                                getCorrectionRotation(
+                                    task.getRotation(),
+                                    task.getTranscodingRotation()
+                                )
+                            )
+                        }
+                        setMediaFormat(newFmt)
+                        if (lastStage && obuf.isNotEmpty) {
+                            setData(obuf.getData())
+                        } else {
+                            asSharable()
+                            setUsage(
+                                obuf.getTypedData(HardwareBuffer::class.java).usage
+                            )
+                        }
+                    }.allocateMutable()
+                }
+
+                ImgpType.RESIZE -> {
+                    SLog.i(TAG, "--- RESIZE ---")
+                    val inW = input.format.cols
+                    val inH = input.format.rows
+                    val scale = maxOf(
+                        targetW.toFloat() / inW,
+                        targetH.toFloat() / inH
+                    )
+
+                    val outW = (scale * inW).roundToNearestEven()
+                    val outH = (scale * inH).roundToNearestEven()
+                    val stride = maxOf(outW, input.format.alignShape.stride)
+
+                    SLog.i(TAG, "resize: in=${inW}x${inH}, out=${outW}x${outH}, stride=$stride, scale=$scale")
+
+                    MediaBuffer.newImageAlloc().apply {
+                        val newFmt = input.format.toMutableFormat().apply {
+                            setCols(outW)
+                            setRows(outH)
+                            alignShape = Align.ofStride(stride, outH)
+                        }
+                        setMediaFormat(newFmt)
+                        if (lastStage && obuf.isNotEmpty) {
+                            setData(obuf.getData())
+                        } else {
+                            asSharable()
+                            setUsage(
+                                obuf.getTypedData(HardwareBuffer::class.java).usage
+                            )
+                        }
+                    }.allocateMutable()
+                }
+
+                ImgpType.CROP -> {
+                    SLog.i(TAG, "--- CROP ---")
+                    val inW = input.format.cols
+                    val inH = input.format.rows
+                    val cropRect = computeCropRectSafe(inW, inH, targetW, targetH)
+                    SLog.i(TAG, "cropRect=$cropRect (in=${inW}x${inH}, target=${targetW}x${targetH})")
+
+                    MediaBuffer.newImageAlloc().apply {
+                        val newFmt = input.format.toMutableFormat().apply {
+                            setCols(cropRect.width())
+                            setRows(cropRect.height())
+                            setCropRect(cropRect)
+                        }
+                        setMediaFormat(newFmt)
+                        if (lastStage && obuf.isNotEmpty) {
+                            setData(obuf.getData())
+                        } else {
+                            asSharable()
+                            setUsage(
+                                obuf.getTypedData(HardwareBuffer::class.java).usage
+                            )
+                        }
+                    }.allocateMutable()
+                }
+
+                else -> throw UnsupportedOperationException("Unsupported imgp: ${converter.imgpType}")
+            }
+
+            // Run filter
+            input = converter.run(input, output)
+        }
+
+        // Validate final buffer matches encoder target
+        check(input.format.cols == targetW && input.format.rows == targetH) {
+            "Final frame size mismatch: ${input.format.cols}x${input.format.rows} != ${targetW}x${targetH}"
+        }
+        input
+    }
+}
